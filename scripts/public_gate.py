@@ -1,21 +1,43 @@
 #!/usr/bin/env python3
-"""Public gate: fail when a tracked file names a lab host or a storage path under the server root.
+"""Public gate: fail when a tracked file or path names a lab host or a server-root storage path.
 
-This repository is public. The list is kept as patterns (a path prefix and the lab's host-naming
-shape), and more can be loaded from the PUBLIC_GATE_EXTRA_PATTERNS environment variable (one
-regular expression per line, set from a CI secret), so no real name has to be written here.
-The report gives file, line and rule number only, never the matched text.
-Usage: public_gate.py FILE...   Exit 0 clean, 1 found, 2 bad pattern.
+This repository is public. The list is kept as patterns, never as names, and more patterns load
+from the PUBLIC_GATE_EXTRA_PATTERNS environment variable (one regular expression per line).
+Fork coverage: CI passes that variable from a repository secret to the gate step only. Pull
+requests from forks get no secrets, so they are checked against the built-in patterns alone.
+
+The gate fails closed: a file it cannot read, decode or vet (unreadable, undecodable, binary,
+UTF-16 without a byte-order mark, a symlink, a directory) is a failure, not a pass.
+Output gives a file, a line number and a rule number. A path or line that itself contains a
+match is never printed.
+
+Each pattern gets PUBLIC_GATE_TIMEOUT seconds per file (default 2); on expiry the gate fails.
+Usage: public_gate.py FILE...   Exit 0 clean, 1 found or not vettable, 2 bad pattern.
 """
+import codecs
 import os
 import re
+import signal
 import sys
 
 BUILTIN = [
-    r"/sr[v]/",            # storage path prefix
-    r"\bai-[0-9]{2}\b",    # lab host-naming shape
-    r"\.ts\.net\b",        # Tailscale names
+    r"(?<![A-Za-z0-9_.-])(?:/|%2f|\\x2f|\\u002f)sr[v](?![A-Za-z0-9_-])",  # storage root, bare too
+    r"(?<![A-Za-z0-9])ai[-_.]?[0-9]{2,3}(?![A-Za-z0-9])",  # lab host-naming shape
+    r"\.ts\.net(?![A-Za-z0-9])",  # Tailscale names
 ]
+BOMS = [
+    (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+]
+
+
+class Timeout(Exception):
+    pass
+
+
+def _alarm(signum, frame):
+    raise Timeout
 
 
 def load_patterns():
@@ -28,30 +50,71 @@ def load_patterns():
         sys.exit(2)
 
 
-def scan(path, patterns):
+def timeout_seconds():
     try:
+        return float(os.environ.get("PUBLIC_GATE_TIMEOUT", "2"))
+    except ValueError:
+        return 2.0
+
+
+def decode(data):
+    for bom, codec in BOMS:
+        if data.startswith(bom):
+            return data.decode(codec)
+    if b"\x00" in data:
+        raise ValueError("binary or UTF-16 without a byte-order mark")
+    return data.decode("utf-8")
+
+
+def search(pattern, text, limit):
+    """Line numbers where pattern matches, bounded in time."""
+    signal.setitimer(signal.ITIMER_REAL, limit)
+    try:
+        return [n for n, line in enumerate(text.split("\n"), 1) if pattern.search(line)]
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def check(path, label, patterns, limit):
+    """Return a list of report lines for one file; empty means clean."""
+    problems = []
+    try:
+        if os.path.islink(path):
+            return [f"{label}: symlink, not vettable"]
         with open(path, "rb") as fh:
             data = fh.read()
-    except OSError:
-        return []
-    if b"\x00" in data:
-        return []
-    hits = []
-    for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
-        for i, p in enumerate(patterns, 1):
-            if p.search(line):
-                hits.append((path, n, i))
-    return hits
+        text = decode(data)
+    except (OSError, ValueError, UnicodeError) as exc:
+        return [f"{label}: unreadable or undecodable ({type(exc).__name__}), not vettable"]
+    for i, pat in enumerate(patterns, 1):
+        try:
+            lines = search(pat, text, limit)
+        except Timeout:
+            problems.append(f"{label}: rule {i} timed out, not vettable")
+            continue
+        problems += [f"{label}:{n}: rule {i} matched, text withheld" for n in lines]
+    return problems
 
 
 def main(argv):
     patterns = load_patterns()
-    hits = [h for f in argv for h in scan(f, patterns)]
-    for path, n, rule in hits:
-        print(f"{path}:{n}: public-gate rule {rule} matched (text withheld)")
-    if hits:
+    limit = timeout_seconds()
+    signal.signal(signal.SIGALRM, _alarm)
+    report = []
+    for k, path in enumerate(argv, 1):
+        try:
+            path_hit = any(p.search(path) for p in patterns)
+        except Exception:
+            path_hit = True
+        label = f"<path #{k} withheld>" if path_hit else path
+        if path_hit:
+            report.append(f"{label}: rule matched in the path itself")
+        report += check(path, label, patterns, limit)
+    for line in report:
+        print(f"public-gate: {line}")
+    if report:
         print("public-gate: failed; host names and storage paths must not be public")
-    return 1 if hits else 0
+    return 1 if report else 0
 
 
 if __name__ == "__main__":

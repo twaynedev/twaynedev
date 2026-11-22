@@ -39,9 +39,16 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.pre-commit-config.yaml') }}
       - run: python -m pip install --disable-pip-version-check --no-input "pre-commit==4.6.2"
-      - run: pre-commit run --show-diff-on-failure --color=always --all-files
+      # No --show-diff-on-failure: a fixer's diff would print the text the gate exists to hide.
+      - name: Hooks
+        run: pre-commit run --color=always --all-files
         env:
-          # Optional extra forbidden patterns, one regex per line, kept in a repository secret.
+          SKIP: public-gate
+      # The optional pattern secret reaches this step only. Pull requests from forks get no
+      # secrets, so they are checked against the built-in patterns alone.
+      - name: Public gate
+        run: pre-commit run public-gate --color=never --all-files
+        env:
           PUBLIC_GATE_EXTRA_PATTERNS: ${{ secrets.PUBLIC_GATE_EXTRA_PATTERNS }}
 
   tests:
@@ -55,6 +62,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
+      - run: python -m pip install --disable-pip-version-check --no-input "pre-commit==4.6.2"
       - run: python -m unittest discover -s tests -v
 
   report:

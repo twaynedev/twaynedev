@@ -43,6 +43,6 @@ repos:
     hooks:
       - id: public-gate
         name: public gate (no host names or storage paths)
-        entry: python3 scripts/public_gate.py
+        entry: python3 -I scripts/public_gate.py
         language: system
-        types: [text]
+        types_or: [file, symlink]
